@@ -1,5 +1,6 @@
 import math
 import json
+import time
 from typing import List, Tuple, Dict, Any
 
 import streamlit as st
@@ -15,6 +16,14 @@ OVERPASS_MIRRORS = [
 	"https://overpass.kumi.systems/api/interpreter",
 	"https://overpass.openstreetmap.ru/api/interpreter",
 ]
+
+# Cache configuration
+MAX_CACHE_SIZE = 50  # Maximum number of cached queries
+MAX_POLYGONS_TO_DISPLAY = 1000  # Limit polygons shown on map for performance
+
+# Rate limiting for geocoding
+_last_geocode_time = 0
+GEOCODE_RATE_LIMIT = 1.0  # seconds between geocoding calls
 
 
 def miles_to_meters(miles: float) -> float:
@@ -34,8 +43,17 @@ def meters_to_sq_miles(m2: float) -> float:
 
 
 def geocode_location(query: str) -> Tuple[float, float]:
+	global _last_geocode_time
+	current_time = time.time()
+	
+	# Rate limiting
+	if current_time - _last_geocode_time < GEOCODE_RATE_LIMIT:
+		time.sleep(GEOCODE_RATE_LIMIT - (current_time - _last_geocode_time))
+	
 	geolocator = Nominatim(user_agent="building-density-app")
 	location = geolocator.geocode(query)
+	_last_geocode_time = time.time()
+	
 	if not location:
 		raise ValueError("Location not found. Try a more specific address or coordinates.")
 	return (location.latitude, location.longitude)
@@ -84,14 +102,25 @@ def fetch_buildings(lat: float, lon: float, radius_m: float, endpoint: str, time
 		except Exception as e:
 			last_err = e
 			# simple backoff
-			try:
-				import time
-				time.sleep(min(2 ** attempt, 5))
-			except Exception:
-				pass
+			time.sleep(min(2 ** attempt, 5))
 	if last_err:
 		raise last_err
 	return []
+
+
+def manage_cache(cache_key: str, elements: List[Dict[str, Any]], timestamp: str) -> None:
+	"""Manage cache size and add new entry"""
+	if "cache" not in st.session_state:
+		st.session_state["cache"] = {}
+	
+	# Add new entry
+	st.session_state["cache"][cache_key] = {"elements": elements, "timestamp": timestamp}
+	
+	# Remove oldest entries if cache is too large
+	if len(st.session_state["cache"]) > MAX_CACHE_SIZE:
+		# Remove oldest entry (simple FIFO)
+		oldest_key = next(iter(st.session_state["cache"]))
+		del st.session_state["cache"][oldest_key]
 
 
 def element_to_polygon(element: Dict[str, Any]) -> Polygon | None:
@@ -112,12 +141,32 @@ def element_to_polygon(element: Dict[str, Any]) -> Polygon | None:
 
 def count_buildings_and_polygons(elements: List[Dict[str, Any]]) -> Tuple[int, List[Polygon]]:
 	polygons: List[Polygon] = []
-	for el in elements:
+	building_count = 0
+	
+	# Use progress bar for large datasets
+	if len(elements) > 100:
+		progress_bar = st.progress(0)
+		status_text = st.empty()
+	
+	for i, el in enumerate(elements):
 		if el.get("type") in {"way", "relation"}:
+			building_count += 1
 			poly = element_to_polygon(el)
 			if poly is not None:
 				polygons.append(poly)
-	return len(polygons), polygons
+		
+		# Update progress for large datasets
+		if len(elements) > 100 and i % 10 == 0:
+			progress = (i + 1) / len(elements)
+			progress_bar.progress(progress)
+			status_text.text(f"Processing building {i + 1} of {len(elements)}")
+	
+	# Clear progress indicators
+	if len(elements) > 100:
+		progress_bar.empty()
+		status_text.empty()
+	
+	return building_count, polygons
 
 
 def compute_density(num_buildings: int, radius_m: float) -> Dict[str, float]:
@@ -140,7 +189,11 @@ def make_map(lat: float, lon: float, radius_m: float, building_polygons: List[Po
 		fill_opacity=0.05,
 		weight=2,
 	).add_to(m)
-	for poly in building_polygons:
+	
+	# Limit polygons for performance
+	polygons_to_display = building_polygons[:MAX_POLYGONS_TO_DISPLAY]
+	
+	for poly in polygons_to_display:
 		try:
 			folium.GeoJson(
 				data=poly.__geo_interface__,
@@ -148,6 +201,8 @@ def make_map(lat: float, lon: float, radius_m: float, building_polygons: List[Po
 			).add_to(m)
 		except Exception:
 			pass
+	
+	# Add center marker
 	folium.Marker([lat, lon], icon=folium.Icon(color="blue", icon="info-sign"), tooltip="Center").add_to(m)
 	return m
 
@@ -273,7 +328,7 @@ def main() -> None:
 				pass
 
 		units = st.selectbox("Radius Units", ["kilometers", "miles"], index=0)
-		radius_value = st.number_input("Radius", min_value=0.1, max_value=50.0, value=1.0, step=0.1)
+		radius_value = st.number_input("Radius", min_value=0.1, max_value=25.0, value=1.0, step=0.1)  # Reduced max to 25km
 		# Use default Overpass settings (no UI)
 		endpoint = OVERPASS_URL
 		timeout_s = 120
@@ -284,16 +339,9 @@ def main() -> None:
 	# Determine center for live map based on current inputs
 	center_lat, center_lon = lat, lon
 	radius_m_from_inputs = kilometers_to_meters(radius_value) if units == "kilometers" else miles_to_meters(radius_value)
-	if input_mode == "Address" and address.strip():
-		# First, attempt to parse raw coordinates like "lat, lon"
-		parsed_coords = parse_lat_lon_from_string(address)
-		if parsed_coords is not None:
-			center_lat, center_lon = parsed_coords
-		else:
-			try:
-				center_lat, center_lon = geocode_location(address)
-			except Exception:
-				pass
+	
+	# Only geocode when Calculate button is pressed, not on every input change
+	# This prevents unnecessary API calls and improves performance
 
 	# Render live map (updates as inputs change). Overlays will be added after calculation.
 	st.subheader("Map")
@@ -302,26 +350,40 @@ def main() -> None:
 	if "calc" in st.session_state and isinstance(st.session_state["calc"], dict):
 		try:
 			polygons_to_show = st.session_state["calc"].get("polygons", [])
-		except Exception:
+		except (KeyError, TypeError):
 			polygons_to_show = []
 
 	results_area = st.empty()
 
 	if query_btn:
 		try:
-			# If address mode, ensure we use geocoded coordinates for calculation
-			calc_lat, calc_lon = (center_lat, center_lon) if input_mode == "Address" else (lat, lon)
-			# Validate ranges for coordinates in Coordinates mode
-			if input_mode == "Coordinates":
-				if not (-90.0 <= calc_lat <= 90.0 and -180.0 <= calc_lon <= 180.0):
-					raise ValueError("Coordinates out of range. Latitude must be -90..90, Longitude -180..180.")
+			# Handle geocoding only when Calculate is pressed
+			calc_lat, calc_lon = lat, lon
+			if input_mode == "Address" and address.strip():
+				# First, attempt to parse raw coordinates like "lat, lon"
+				parsed_coords = parse_lat_lon_from_string(address)
+				if parsed_coords is not None:
+					calc_lat, calc_lon = parsed_coords
+				else:
+					try:
+						calc_lat, calc_lon = geocode_location(address)
+					except Exception as e:
+						st.error(f"Geocoding failed: {str(e)}")
+						return
+			
+			# Validate ranges for coordinates
+			if not (-90.0 <= calc_lat <= 90.0 and -180.0 <= calc_lon <= 180.0):
+				raise ValueError("Coordinates out of range. Latitude must be -90..90, Longitude -180..180.")
+			
+			# Validate radius size
+			if radius_m_from_inputs > 25000:  # 25km limit
+				raise ValueError("Radius too large. Maximum allowed is 25km to prevent timeouts.")
+			
 			# Build cache key and check
-			if "cache" not in st.session_state:
-				st.session_state["cache"] = {}
 			cache_key = f"{endpoint}|{round(calc_lat,6)}|{round(calc_lon,6)}|{round(radius_m_from_inputs,2)}|{timeout_s}"
 			cache_hit = False
 			elements: List[Dict[str, Any]]
-			if not force_refresh and cache_key in st.session_state["cache"]:
+			if not force_refresh and "cache" in st.session_state and cache_key in st.session_state["cache"]:
 				cache_hit = True
 				elements = st.session_state["cache"][cache_key]["elements"]
 				queried_at = st.session_state["cache"][cache_key]["timestamp"]
@@ -330,7 +392,8 @@ def main() -> None:
 					elements = fetch_buildings(calc_lat, calc_lon, radius_m_from_inputs, endpoint, timeout_s, retries)
 					import datetime as _dt
 					queried_at = _dt.datetime.utcnow().isoformat() + "Z"
-					st.session_state["cache"][cache_key] = {"elements": elements, "timestamp": queried_at}
+					manage_cache(cache_key, elements, queried_at)
+			
 			with st.spinner("Processing geometries..."):
 				num_buildings, polygons = count_buildings_and_polygons(elements)
 				stats = compute_density(num_buildings, radius_m_from_inputs)
@@ -353,7 +416,7 @@ def main() -> None:
 
 			# Render results below (outside button) using session state
 		except Exception as e:
-			st.error(str(e))
+			st.error(f"Error: {str(e)}")
 
 	# If we have saved results, display them persistently
 	if "calc" in st.session_state and isinstance(st.session_state["calc"], dict):
@@ -367,6 +430,11 @@ def main() -> None:
 				st.write(f"Search area: {_saved['stats']['area_sq_km']:.3f} sq km ({_saved['stats']['area_sq_miles']:.3f} sq mi)")
 				st.write(f"Density: {_saved['stats']['per_sq_km']:.2f} buildings/sq km")
 				st.write(f"Density: {_saved['stats']['per_sq_mile']:.2f} buildings/sq mi")
+				
+				# Show polygon display limit warning
+				if len(_saved['polygons']) > MAX_POLYGONS_TO_DISPLAY:
+					st.warning(f"⚠️ Showing first {MAX_POLYGONS_TO_DISPLAY} buildings on map for performance. Total: {len(_saved['polygons'])} buildings found.")
+				
 				with st.expander("Run metadata"):
 					st.write(f"Endpoint: {_saved.get('endpoint','')}")
 					st.write(f"Timeout: {_saved.get('timeout_s', 0)}s, Retries: {_saved.get('retries', 0)}")
@@ -379,10 +447,12 @@ def main() -> None:
 				st_folium(m_results, width=None, height=600, key="results_map")
 
 	# Draw the map with current center and radius, overlay polygons if available
-	st.markdown("<div class='card'>", unsafe_allow_html=True)
-	m = make_map(center_lat, center_lon, radius_m_from_inputs, polygons_to_show)
-	st_folium(m, width=None, height=600, key="live_map")
-	st.markdown("</div>", unsafe_allow_html=True)
+	# Only show this map if no results are displayed (avoid duplication)
+	if "calc" not in st.session_state or not isinstance(st.session_state["calc"], dict):
+		st.markdown("<div class='card'>", unsafe_allow_html=True)
+		m = make_map(center_lat, center_lon, radius_m_from_inputs, polygons_to_show)
+		st_folium(m, width=None, height=600, key="live_map")
+		st.markdown("</div>", unsafe_allow_html=True)
 
 	st.caption("Built with Streamlit, Folium, and OpenStreetMap data.")
 
