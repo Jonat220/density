@@ -19,7 +19,6 @@ OVERPASS_MIRRORS = [
 
 # Cache configuration
 MAX_CACHE_SIZE = 50  # Maximum number of cached queries
-MAX_POLYGONS_TO_DISPLAY = 1000  # Limit polygons shown on map for performance
 
 # Rate limiting for geocoding
 _last_geocode_time = 0
@@ -190,10 +189,7 @@ def make_map(lat: float, lon: float, radius_m: float, building_polygons: List[Po
 		weight=2,
 	).add_to(m)
 	
-	# Limit polygons for performance
-	polygons_to_display = building_polygons[:MAX_POLYGONS_TO_DISPLAY]
-	
-	for poly in polygons_to_display:
+	for poly in building_polygons:
 		try:
 			folium.GeoJson(
 				data=poly.__geo_interface__,
@@ -430,10 +426,6 @@ def main() -> None:
 				st.write(f"Search area: {_saved['stats']['area_sq_km']:.3f} sq km ({_saved['stats']['area_sq_miles']:.3f} sq mi)")
 				st.write(f"Density: {_saved['stats']['per_sq_km']:.2f} buildings/sq km")
 				st.write(f"Density: {_saved['stats']['per_sq_mile']:.2f} buildings/sq mi")
-				
-				# Show polygon display limit warning
-				if len(_saved['polygons']) > MAX_POLYGONS_TO_DISPLAY:
-					st.warning(f"⚠️ Showing first {MAX_POLYGONS_TO_DISPLAY} buildings on map for performance. Total: {len(_saved['polygons'])} buildings found.")
 				
 				with st.expander("Run metadata"):
 					st.write(f"Endpoint: {_saved.get('endpoint','')}")
